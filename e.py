@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 Vector-Based Reasoning Model - All-in-One Training Script
-Trains from SCRATCH - no pre-trained models needed!
 Reasons in vectors, speaks in English
+
+This script:
+1. Installs all dependencies
+2. Runs system tests
+3. Trains the model
+4. Saves checkpoints every 5 minutes (deletes old ones)
 """
 
 import subprocess
@@ -12,7 +17,7 @@ import time
 from pathlib import Path
 
 print("=" * 80)
-print("🚀 VECTOR REASONING MODEL - TRAINING FROM SCRATCH")
+print("🚀 VECTOR REASONING MODEL - ALL-IN-ONE TRAINING")
 print("=" * 80)
 
 # ============================================================================
@@ -25,6 +30,8 @@ dependencies = [
     "transformers>=4.36.0",
     "accelerate>=0.25.0",
     "datasets>=2.16.0",
+    "peft>=0.7.0",
+    "bitsandbytes>=0.41.0",
     "sentencepiece>=0.1.99",
     "protobuf>=3.20.0",
 ]
@@ -47,21 +54,21 @@ print("✅ Dependencies installed!")
 # ============================================================================
 print("\n🧪 STEP 2/3: Running system tests...")
 
+# Now import after installation
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer, 
-    LlamaConfig,
-    LlamaForCausalLM,
+    AutoModelForCausalLM,
     get_cosine_schedule_with_warmup,
-    DataCollatorForLanguageModeling,
 )
 from datasets import load_dataset
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from accelerate import Accelerator
+from peft import LoraConfig, get_peft_model, TaskType
 
 # Test 1: CUDA availability
 print("  Test 1: Checking CUDA...")
@@ -76,7 +83,7 @@ for i in range(torch.cuda.device_count()):
 
 # Test 2: Memory check
 print("  Test 2: Checking GPU memory...")
-min_memory_gb = 12
+min_memory_gb = 20
 for i in range(torch.cuda.device_count()):
     memory_gb = torch.cuda.get_device_properties(i).total_memory / 1024**3
     if memory_gb < min_memory_gb:
@@ -115,6 +122,7 @@ except Exception as e:
     print(f"  ❌ Transformer test failed: {e}")
     sys.exit(1)
 
+# Test 5: Skip Accelerator test (will initialize during training)
 print("  Test 5: Skipping Accelerator test (will init during training)")
 print("  ✅ Multi-GPU support ready")
 
@@ -128,14 +136,8 @@ print("🎯 STEP 3/3: Starting training...\n")
 # Configuration
 @dataclass
 class VectorReasoningConfig:
-    # Model architecture (7B parameters)
-    vocab_size: int = 32000
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 32
-    max_position_embeddings: int = 2048
+    # Model settings
+    base_model: str = "meta-llama/Llama-2-7b-hf"
     
     # Vector reasoning space
     reasoning_dim: int = 2048
@@ -143,14 +145,17 @@ class VectorReasoningConfig:
     num_reasoning_heads: int = 16
     
     # Training settings
-    batch_size: int = 2  # Smaller for 16GB GPU
-    gradient_accumulation_steps: int = 16  # Effective batch = 32
-    learning_rate: float = 3e-4  # Higher for from-scratch training
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 8
+    learning_rate: float = 2e-5
     max_steps: int = 5000
     warmup_steps: int = 500
     max_length: int = 512
     
     # Optimization
+    use_lora: bool = True
+    lora_r: int = 64
+    lora_alpha: int = 128
     gradient_checkpointing: bool = True
     bf16: bool = True
     
@@ -233,7 +238,7 @@ class VectorReasoningModule(nn.Module):
 
 
 class VectorReasoningModel(nn.Module):
-    """LLM with vector reasoning built from scratch"""
+    """Wraps base LLM with vector reasoning"""
     def __init__(self, base_model, config: VectorReasoningConfig):
         super().__init__()
         self.base_model = base_model
@@ -297,16 +302,15 @@ Solution:"""
     dataset = dataset.map(format_example, remove_columns=dataset.column_names)
     
     def tokenize_function(examples):
-        # Tokenize without converting to tensors yet
-        result = tokenizer(
+        outputs = tokenizer(
             examples["text"],
             truncation=True,
             max_length=config.max_length,
             padding="max_length",
+            return_tensors="pt"
         )
-        # Copy input_ids to labels
-        result["labels"] = result["input_ids"].copy()
-        return result
+        outputs["labels"] = outputs["input_ids"].clone()
+        return outputs
     
     tokenized_dataset = dataset.map(
         tokenize_function,
@@ -315,19 +319,6 @@ Solution:"""
     )
     
     return tokenized_dataset
-
-
-def collate_fn(examples):
-    """Custom collate function to properly convert to tensors"""
-    input_ids = torch.tensor([ex['input_ids'] for ex in examples], dtype=torch.long)
-    attention_mask = torch.tensor([ex['attention_mask'] for ex in examples], dtype=torch.long)
-    labels = torch.tensor([ex['labels'] for ex in examples], dtype=torch.long)
-    
-    return {
-        'input_ids': input_ids,
-        'attention_mask': attention_mask,
-        'labels': labels
-    }
 
 
 def save_checkpoint(model, tokenizer, optimizer, scheduler, step, config, accelerator):
@@ -340,10 +331,10 @@ def save_checkpoint(model, tokenizer, optimizer, scheduler, step, config, accele
         
         # Save model
         unwrapped_model = accelerator.unwrap_model(model)
-        torch.save(unwrapped_model.state_dict(), checkpoint_path / "model.pt")
-        
-        # Save config
-        torch.save(config, checkpoint_path / "config.pt")
+        if config.use_lora:
+            unwrapped_model.base_model.save_pretrained(checkpoint_path)
+        else:
+            torch.save(unwrapped_model.state_dict(), checkpoint_path / "model.pt")
         
         # Save tokenizer
         tokenizer.save_pretrained(checkpoint_path)
@@ -379,10 +370,10 @@ def main():
     )
     
     print("=" * 80)
-    print("🧠 VECTOR REASONING MODEL - TRAINING FROM SCRATCH")
+    print("🧠 VECTOR REASONING MODEL TRAINING")
     print("=" * 80)
     print(f"💻 GPUs: {accelerator.num_processes}")
-    print(f"🎯 Model size: ~7B parameters")
+    print(f"🎯 Base model: {config.base_model}")
     print(f"📊 Reasoning dimension: {config.reasoning_dim}D")
     print(f"🔬 Reasoning layers: {config.num_reasoning_layers}")
     print(f"⏱️  Checkpoint interval: {config.checkpoint_interval_minutes} minutes")
@@ -390,52 +381,52 @@ def main():
     print("=" * 80)
     print()
     
-    # Create tokenizer from scratch (using LLaMA tokenizer as base)
-    print("📝 Creating tokenizer...")
-    # Use a public tokenizer that doesn't require authentication
-    tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b", use_fast=False)
+    # Load tokenizer
+    print("📝 Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(config.base_model)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Create model from scratch
-    print("🔧 Initializing 7B model from scratch (this will take a moment)...")
-    llama_config = LlamaConfig(
-        vocab_size=config.vocab_size,
-        hidden_size=config.hidden_size,
-        intermediate_size=config.intermediate_size,
-        num_hidden_layers=config.num_hidden_layers,
-        num_attention_heads=config.num_attention_heads,
-        num_key_value_heads=config.num_key_value_heads,
-        max_position_embeddings=config.max_position_embeddings,
+    # Load base model
+    print("🔧 Loading base model (this may take a few minutes)...")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.base_model,
+        torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+        device_map=None,
     )
-    
-    base_model = LlamaForCausalLM(llama_config)
-    
-    # Count parameters
-    total_params = sum(p.numel() for p in base_model.parameters())
-    print(f"✅ Model initialized: {total_params/1e9:.2f}B parameters")
     
     if config.gradient_checkpointing:
         base_model.gradient_checkpointing_enable()
+    
+    # Apply LoRA
+    if config.use_lora:
+        print("🔗 Applying LoRA for memory efficiency...")
+        lora_config = LoraConfig(
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.1,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+        base_model = get_peft_model(base_model, lora_config)
+        if accelerator.is_main_process:
+            base_model.print_trainable_parameters()
     
     # Add vector reasoning
     print("🧮 Adding vector reasoning module...")
     model = VectorReasoningModel(base_model, config)
     
-    reasoning_params = sum(p.numel() for p in model.reasoning_module.parameters())
-    print(f"   Reasoning module: {reasoning_params/1e6:.1f}M additional parameters")
-    
     # Prepare dataset
     train_dataset = prepare_dataset(config, tokenizer)
     print(f"📚 Dataset loaded: {len(train_dataset)} examples")
     
-    # DataLoader with custom collate function
+    # DataLoader
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=0,  # Set to 0 for Windows compatibility
-        pin_memory=True,
-        collate_fn=collate_fn  # Use custom collate function
+        num_workers=4,
+        pin_memory=True
     )
     
     # Optimizer
@@ -460,7 +451,7 @@ def main():
     
     # Training loop
     print("\n" + "=" * 80)
-    print("🎯 STARTING TRAINING FROM SCRATCH")
+    print("🎯 STARTING TRAINING")
     print("=" * 80)
     effective_batch = config.batch_size * config.gradient_accumulation_steps * accelerator.num_processes
     print(f"📦 Effective batch size: {effective_batch}")
@@ -521,7 +512,7 @@ def main():
                 
                 # Time-based checkpointing
                 current_time = time.time()
-                time_since_checkpoint = (current_time - last_checkpoint_time) / 60
+                time_since_checkpoint = (current_time - last_checkpoint_time) / 60  # minutes
                 
                 if time_since_checkpoint >= config.checkpoint_interval_minutes:
                     save_checkpoint(model, tokenizer, optimizer, lr_scheduler, global_step, config, accelerator)
@@ -541,8 +532,11 @@ def main():
         
         print(f"💾 Saving final model to {final_dir}...")
         unwrapped_model = accelerator.unwrap_model(model)
-        torch.save(unwrapped_model.state_dict(), final_dir / "model.pt")
-        torch.save(config, final_dir / "config.pt")
+        if config.use_lora:
+            unwrapped_model.base_model.save_pretrained(final_dir)
+        else:
+            torch.save(unwrapped_model.state_dict(), final_dir / "model.pt")
+        
         tokenizer.save_pretrained(final_dir)
         
         total_time = time.time() - start_time
@@ -551,7 +545,7 @@ def main():
         print(f"   Total steps: {global_step}")
         print(f"   Average speed: {global_step/(total_time/60):.2f} steps/minute")
         print(f"\n📁 Model saved to: {final_dir}")
-        print("\n🎉 Model trained from SCRATCH! Reasons in VECTORS, speaks in ENGLISH!")
+        print("\n🎉 The model reasons in VECTORS, speaks in ENGLISH!")
 
 
 if __name__ == "__main__":
