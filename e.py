@@ -55,6 +55,7 @@ from transformers import (
     LlamaConfig,
     LlamaForCausalLM,
     get_cosine_schedule_with_warmup,
+    DataCollatorForLanguageModeling,
 )
 from datasets import load_dataset
 import math
@@ -296,14 +297,16 @@ Solution:"""
     dataset = dataset.map(format_example, remove_columns=dataset.column_names)
     
     def tokenize_function(examples):
-        outputs = tokenizer(
+        # Tokenize without converting to tensors yet
+        result = tokenizer(
             examples["text"],
             truncation=True,
             max_length=config.max_length,
             padding="max_length",
         )
-        outputs["labels"] = outputs["input_ids"]
-        return outputs
+        # Copy input_ids to labels
+        result["labels"] = result["input_ids"].copy()
+        return result
     
     tokenized_dataset = dataset.map(
         tokenize_function,
@@ -311,10 +314,20 @@ Solution:"""
         remove_columns=["text"]
     )
     
-    # Set format to torch tensors
-    tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-    
     return tokenized_dataset
+
+
+def collate_fn(examples):
+    """Custom collate function to properly convert to tensors"""
+    input_ids = torch.tensor([ex['input_ids'] for ex in examples], dtype=torch.long)
+    attention_mask = torch.tensor([ex['attention_mask'] for ex in examples], dtype=torch.long)
+    labels = torch.tensor([ex['labels'] for ex in examples], dtype=torch.long)
+    
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels
+    }
 
 
 def save_checkpoint(model, tokenizer, optimizer, scheduler, step, config, accelerator):
@@ -415,13 +428,14 @@ def main():
     train_dataset = prepare_dataset(config, tokenizer)
     print(f"📚 Dataset loaded: {len(train_dataset)} examples")
     
-    # DataLoader
+    # DataLoader with custom collate function
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=0,  # Set to 0 for Windows compatibility
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn  # Use custom collate function
     )
     
     # Optimizer
