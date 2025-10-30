@@ -301,9 +301,8 @@ Solution:"""
             truncation=True,
             max_length=config.max_length,
             padding="max_length",
-            return_tensors="pt"
         )
-        outputs["labels"] = outputs["input_ids"].clone()
+        outputs["labels"] = outputs["input_ids"]
         return outputs
     
     tokenized_dataset = dataset.map(
@@ -311,6 +310,9 @@ Solution:"""
         batched=True,
         remove_columns=["text"]
     )
+    
+    # Set format to torch tensors
+    tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
     
     return tokenized_dataset
 
